@@ -15,6 +15,9 @@
 #   L20_GPU_DEV=1 ./scripts/deploy-local-k8s.sh
 # Uses values-local-gpu-dev.yaml: operator creates DynamoGraphDeployment in dynamoNamespace (default `dynamo`).
 # After deploy, set gateway.dynamoFrontendUrl or run scripts/bind-taas-dynamo-frontend.sh for /v1 proxying.
+#
+# Extra arguments are passed through to `helm upgrade --install`, e.g.:
+#   L20_GPU_DEV=1 ./scripts/deploy-local-k8s.sh --set dynamoOperator.dynamoNamespace=dynamo-system
 
 set -euo pipefail
 
@@ -26,6 +29,7 @@ RELEASE="${RELEASE:-taas-local}"
 IMAGE_TAG="${IMAGE_TAG:-local}"
 FULLSTACK="${FULLSTACK:-0}"
 L20_GPU_DEV="${L20_GPU_DEV:-0}"
+EXTRA_HELM_ARGS=("$@")
 
 IMG_GATEWAY="taas-gateway:${IMAGE_TAG}"
 IMG_WEB="taas-web:${IMAGE_TAG}"
@@ -134,7 +138,8 @@ helm upgrade --install "${RELEASE}" deploy/helm/taas \
   --create-namespace \
   "${HELM_VALUES_FLAGS[@]}" \
   --set "image.tag=${IMAGE_TAG}" \
-  "${HELM_IMAGE_SET[@]}"
+  "${HELM_IMAGE_SET[@]}" \
+  "${EXTRA_HELM_ARGS[@]}"
 
 PG_POD="$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=postgresql --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}')"
 if [[ -z "${PG_POD}" ]]; then
