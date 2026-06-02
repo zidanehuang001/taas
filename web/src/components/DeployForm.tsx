@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { DeploymentConfig } from '../api/client';
 
-const GPU_OPTIONS = ['h200_sxm', 'h100_sxm', 'a100_sxm', 'a10g', 'l40s'];
+const GPU_OPTIONS = ['h200_sxm', 'h100_sxm', 'h20', 'l20', 'a100_sxm', 'a10g', 'l40s'];
 const TP_OPTIONS = [1, 2, 4, 8];
 const PP_OPTIONS = [1, 2, 4];
 
@@ -15,10 +15,10 @@ interface Props {
 
 const defaultConfig: DeploymentConfig = {
   name: '',
-  deploy_mode: 'dgdr',
+  deploy_mode: 'dgd',
   sla_tier: 'standard',
   backend: 'vllm',
-  gpu_type: 'h100_sxm',
+  gpu_type: 'l20',
   gpu_count_per_replica: 1,
   num_gpus_per_node: 8,
   replicas_min: 1,
