@@ -75,6 +75,17 @@ Usage: {{ include "taas.image" (dict "repo" .Values.gateway.image.repository "ro
 {{- end }}
 
 {{/*
+Pin locally built images to the node where scripts/deploy-local-k8s.sh imported
+them. This is only used when localImages.nodeName is set.
+*/}}
+{{- define "taas.localImageNodeSelector" -}}
+{{- if .Values.localImages.nodeName }}
+nodeSelector:
+  kubernetes.io/hostname: {{ .Values.localImages.nodeName | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
 PostgreSQL service hostname (Bitnami subchart default).
 */}}
 {{- define "taas.postgresqlHost" -}}

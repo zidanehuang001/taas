@@ -25,16 +25,16 @@ const defaultConfig: DeploymentConfig = {
   replicas_max: 1,
   tensor_parallel_size: 1,
   pipeline_parallel_size: 1,
-  input_sequence_length: 4096,
-  output_sequence_length: 512,
-  target_ttft_ms: 500,
-  target_itl_ms: 20,
+  input_sequence_length: 2048,
+  output_sequence_length: 256,
+  target_ttft_ms: 2000,
+  target_itl_ms: 200,
   search_strategy: 'rapid',
-  disagg_enabled: false,
+  disagg_enabled: true,
   prefill_replicas: 1,
   decode_replicas: 1,
   frontend_replicas: 1,
-  router_mode: 'random',
+  router_mode: 'kv',
   max_batch_size: 32,
   max_sequence_length: 4096,
   dtype: 'auto',
@@ -453,7 +453,21 @@ function generatePreview(config: DeploymentConfig, modelSlug: string): string {
 
   // DGD preview
   const ns = config.dynamo_namespace || `taas-${config.name}`;
+  const profileCm = `planner-profile-data-${config.name}`;
   const lines = [
+    ...(config.disagg_enabled ? [
+      `apiVersion: v1`,
+      `kind: ConfigMap`,
+      `metadata:`,
+      `  name: ${profileCm}`,
+      `  namespace: ${ns}`,
+      `data:`,
+      `  prefill_raw_data.json: |`,
+      `    { ... }`,
+      `  decode_raw_data.json: |`,
+      `    { ... }`,
+      `---`,
+    ] : []),
     `apiVersion: nvidia.com/v1alpha1`,
     `kind: DynamoGraphDeployment`,
     `metadata:`,
@@ -465,28 +479,35 @@ function generatePreview(config: DeploymentConfig, modelSlug: string): string {
     `      componentType: frontend`,
     `      replicas: ${config.frontend_replicas ?? 1}`,
     `      envs:`,
-    `        DYN_ROUTER_MODE: "${config.router_mode ?? 'random'}"`,
+    `        DYN_ROUTER_MODE: "${config.router_mode ?? 'kv'}"`,
   ];
 
   if (config.disagg_enabled) {
-    lines.push(`    PrefillWorker:`);
+    lines.push(`    VllmPrefillWorker:`);
     lines.push(`      dynamoNamespace: ${ns}`);
     lines.push(`      componentType: worker`);
+    lines.push(`      subComponentType: prefill`);
     lines.push(`      replicas: ${config.prefill_replicas ?? 1}`);
     lines.push(`      resources:`);
     lines.push(`        limits:`);
     lines.push(`          gpu: "${config.gpu_count_per_replica ?? 1}"`);
     lines.push(`      args:`);
     lines.push(`        - python3 -m dynamo.${config.backend} --model ${modelSlug} --disaggregation-mode prefill`);
-    lines.push(`    DecodeWorker:`);
+    lines.push(`    VllmDecodeWorker:`);
     lines.push(`      dynamoNamespace: ${ns}`);
     lines.push(`      componentType: worker`);
+    lines.push(`      subComponentType: decode`);
     lines.push(`      replicas: ${config.decode_replicas ?? 1}`);
     lines.push(`      resources:`);
     lines.push(`        limits:`);
     lines.push(`          gpu: "${config.gpu_count_per_replica ?? 1}"`);
     lines.push(`      args:`);
-    lines.push(`        - python3 -m dynamo.${config.backend} --model ${modelSlug} --disaggregation-mode decode`);
+    lines.push(`        - python3 -m dynamo.${config.backend} --model ${modelSlug}`);
+    lines.push(`    Planner:`);
+    lines.push(`      dynamoNamespace: ${ns}`);
+    lines.push(`      componentType: planner`);
+    lines.push(`      replicas: 1`);
+    lines.push(`      profileConfigMap: ${profileCm}`);
   } else {
     lines.push(`    Worker:`);
     lines.push(`      dynamoNamespace: ${ns}`);

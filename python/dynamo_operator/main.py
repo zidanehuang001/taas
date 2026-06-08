@@ -139,15 +139,17 @@ async def lifespan(app: FastAPI):
             if is_running:
                 if deployment_id in running_published:
                     return
-                try:
-                    await dgd_client._ensure_vllm_worker_discovery_service(
-                        deployment_id=deployment_id, dgd_name=dgd_name,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to ensure worker discovery Service for %s (Frontend may list 0 backends)",
-                        dgd_name,
-                    )
+                services = (obj.get("spec") or {}).get("services") or {}
+                if "VllmPrefillWorker" not in services:
+                    try:
+                        await dgd_client._ensure_vllm_worker_discovery_service(
+                            deployment_id=deployment_id, dgd_name=dgd_name,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to ensure worker discovery Service for %s (Frontend may list 0 backends)",
+                            dgd_name,
+                        )
                 base = await dgd_client.resolve_frontend_base_url(
                     deployment_id=deployment_id,
                     dgd_name=dgd_name,

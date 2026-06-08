@@ -28,6 +28,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- include "taas.localImageNodeSelector" . | nindent 6 }}
       containers:
         - name: nginx
           image: {{ include "taas.image" (dict "repo" .Values.web.image.repository "root" .) }}

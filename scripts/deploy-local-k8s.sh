@@ -113,6 +113,9 @@ else
   if import_images; then
     HELM_IMAGE_SET+=(--set "global.imageRegistry=")
     HELM_IMAGE_SET+=(--set "image.pullPolicy=Never")
+    LOCAL_IMAGE_NODE_NAME="${LOCAL_IMAGE_NODE_NAME:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+    HELM_IMAGE_SET+=(--set "localImages.nodeName=${LOCAL_IMAGE_NODE_NAME}")
+    echo "==> Pinning locally built images to node: ${LOCAL_IMAGE_NODE_NAME}"
   else
     echo "ERROR: Could not import images into containerd." >&2
     echo "Fix one of:" >&2

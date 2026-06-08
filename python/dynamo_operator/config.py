@@ -16,10 +16,14 @@ class Settings(BaseSettings):
     nvidia_dgd_version: str = "v1alpha1"
     nvidia_dgd_plural: str = "dynamographdeployments"
     nvidia_dgd_runtime_image: str = "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1"
+    nvidia_dgd_planner_image: str = ""
+    nvidia_dgd_image_pull_secret_name: str = "ngc-regcred"
     nvidia_dgd_hf_secret_name: str = "hf-token-secret"
     nvidia_hf_model_default: str = "Qwen/Qwen3-0.6B"
     nvidia_frontend_url_template: str = "http://{dgd_name}-frontend.{namespace}.svc.cluster.local:{port}"
     nvidia_resolve_frontend_via_k8s: bool = True
+    global_planner_namespace: str = "dynamo-system-gp-ctrl"
+    metric_pulling_prometheus_endpoint: str = "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"
 
     postgres_dsn: str = "postgresql://taas:taas@localhost:5432/taas"
     redis_url: str = "redis://localhost:6379"

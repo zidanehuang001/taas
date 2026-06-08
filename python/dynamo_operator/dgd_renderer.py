@@ -7,6 +7,7 @@ be validated with fast unit tests before the operator applies the CR.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shlex
 from typing import Any
@@ -92,6 +93,230 @@ def _runtime_image(payload: dict[str, Any], settings: Any) -> str:
     return "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1"
 
 
+def _setting(settings: Any, name: str, default: Any) -> Any:
+    value = getattr(settings, name, default)
+    if value is None:
+        return default
+    return value
+
+
+def _image_pull_secrets(settings: Any) -> list[dict[str, str]]:
+    secret = str(_setting(settings, "nvidia_dgd_image_pull_secret_name", "ngc-regcred")).strip()
+    if not secret:
+        return []
+    return [{"name": secret}]
+
+
+def _cache_volume() -> dict[str, Any]:
+    return {
+        "name": "hf-model-cache",
+        "hostPath": {"path": "/data/hf-model-cache", "type": "DirectoryOrCreate"},
+    }
+
+
+def _cache_volume_mount() -> dict[str, str]:
+    return {
+        "name": "hf-model-cache",
+        "mountPath": "/home/dynamo/.cache/huggingface/hub",
+    }
+
+
+def _profile_config_map_name(deployment_id: str) -> str:
+    return f"planner-profile-data-{dgd_name_for_deployment(deployment_id)}"
+
+
+def _profile_data(payload: dict[str, Any]) -> dict[str, str]:
+    # Synthetic but regression-safe defaults for L20/vLLM smoke validation. Real
+    # customer validation should replace these with DGDR/AIPerf profile output.
+    prefill = payload.get("profile_prefill_raw_data")
+    if not isinstance(prefill, dict):
+        prefill = {
+            "prefill_isl": [128, 256, 512, 1024, 2048],
+            "prefill_ttft": [30, 55, 110, 260, 700],
+            "prefill_thpt_per_gpu": [1800, 1450, 980, 520, 240],
+        }
+    decode = payload.get("profile_decode_raw_data")
+    if not isinstance(decode, dict):
+        decode = {
+            "x_kv_usage": [0.1, 0.1, 0.1, 0.1, 0.3, 0.3, 0.3, 0.3, 0.5, 0.5, 0.5, 0.5, 0.7, 0.7, 0.7, 0.7, 0.9, 0.9, 0.9, 0.9],
+            "y_context_length": [128, 512, 1024, 2048, 128, 512, 1024, 2048, 128, 512, 1024, 2048, 128, 512, 1024, 2048, 128, 512, 1024, 2048],
+            "z_itl": [28, 24, 22, 20, 34, 30, 27, 24, 43, 37, 33, 29, 55, 47, 41, 36, 72, 61, 52, 45],
+            "z_thpt_per_gpu": [720, 650, 560, 420, 660, 580, 500, 360, 560, 500, 420, 300, 460, 400, 320, 230, 340, 290, 230, 160],
+            "max_kv_tokens": 32768,
+        }
+    return {
+        "prefill_raw_data.json": json.dumps(prefill, indent=2),
+        "decode_raw_data.json": json.dumps(decode, indent=2),
+    }
+
+
+def render_profile_config_map(payload: dict[str, Any], namespace: str) -> dict[str, Any]:
+    deployment_id = payload["deployment_id"]
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": _profile_config_map_name(deployment_id),
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/managed-by": "taas-dynamo-operator",
+                "taas.io/deployment-id": deployment_id,
+            },
+        },
+        "data": _profile_data(payload),
+    }
+
+
+def _vllm_worker_args(
+    *,
+    hf_model: str,
+    tensor_parallel: int,
+    payload: dict[str, Any],
+    disaggregation_mode: str | None = None,
+    kv_transfer: bool = False,
+) -> list[str]:
+    args = ["--model", hf_model]
+    if tensor_parallel > 1:
+        args.extend(["--tensor-parallel-size", str(tensor_parallel)])
+    if disaggregation_mode:
+        args.extend(["--disaggregation-mode", disaggregation_mode])
+    if kv_transfer:
+        args.extend(["--kv-transfer-config", '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'])
+    dtype = (payload.get("dtype") or "").strip()
+    if dtype and dtype != "auto":
+        args.extend(["--dtype", dtype])
+    max_len = int(payload.get("max_sequence_length") or 0)
+    if max_len > 0:
+        args.extend(["--max-model-len", str(max_len)])
+    if not payload.get("extra_args"):
+        args.extend(["--gpu-memory-utilization", "0.80"])
+    _append_extra_args(args, payload.get("extra_args"))
+    return args
+
+
+def render_vllm_disagg_dgd_spec(payload: dict[str, Any], settings: Any) -> dict[str, Any]:
+    """Render a single-model vLLM disaggregated DGD with Planner + profile ConfigMap."""
+    hf_model = _hf_model(payload, settings)
+    tensor_parallel = _int_at_least(payload, "tensor_parallel_size", 1)
+    prefill_replicas = _int_at_least(payload, "prefill_replicas", 1)
+    decode_replicas = _int_at_least(payload, "decode_replicas", 1)
+    frontend_replicas = _int_at_least(payload, "frontend_replicas", 1)
+    gpu_count = max(_int_at_least(payload, "gpu_count_per_replica", tensor_parallel), tensor_parallel)
+    image = _runtime_image(payload, settings)
+    env = _env_list(payload)
+    secret = (settings.nvidia_dgd_hf_secret_name or "").strip()
+    image_pull_secrets = _image_pull_secrets(settings)
+    deployment_id = payload["deployment_id"]
+    profile_cm = _profile_config_map_name(deployment_id)
+
+    frontend: dict[str, Any] = {
+        "componentType": "frontend",
+        "replicas": frontend_replicas,
+        "envs": [{"name": "DYN_ROUTER_MODE", "value": str(payload.get("router_mode") or "kv")}],
+        "extraPodSpec": {
+            "imagePullSecrets": image_pull_secrets,
+            "mainContainer": {
+                "image": image,
+                "env": env,
+                "workingDir": "/workspace",
+                "command": ["python3", "-m", "dynamo.frontend"],
+                "args": ["--model-name", hf_model],
+            },
+        },
+    }
+
+    def worker(sub_component: str, replicas: int) -> dict[str, Any]:
+        disagg_mode = "prefill" if sub_component == "prefill" else None
+        return {
+            "componentType": "worker",
+            "subComponentType": sub_component,
+            "replicas": replicas,
+            "resources": {"limits": {"gpu": str(gpu_count)}},
+            "extraPodSpec": {
+                "imagePullSecrets": image_pull_secrets,
+                "volumes": [_cache_volume()],
+                "mainContainer": {
+                    "image": image,
+                    "env": env,
+                    "workingDir": "/workspace/examples/backends/vllm",
+                    "command": ["python3", "-m", "dynamo.vllm"],
+                    "args": _vllm_worker_args(
+                        hf_model=hf_model,
+                        tensor_parallel=tensor_parallel,
+                        payload=payload,
+                        disaggregation_mode=disagg_mode,
+                        kv_transfer=True,
+                    ),
+                },
+                "volumeMounts": [_cache_volume_mount()],
+            },
+        }
+
+    planner_config = {
+        "environment": "global-planner",
+        "global_planner_namespace": str(_setting(settings, "global_planner_namespace", "dynamo-system-gp-ctrl")),
+        "backend": "vllm",
+        "mode": "disagg",
+        "optimization_target": "sla",
+        "enable_load_scaling": False,
+        "enable_throughput_scaling": True,
+        "throughput_metrics_source": "frontend",
+        "throughput_adjustment_interval": int(payload.get("throughput_adjustment_interval") or 60),
+        "ttft": float(payload.get("target_ttft_ms") or 2000),
+        "itl": float(payload.get("target_itl_ms") or 200),
+        "max_gpu_budget": -1,
+        "prefill_engine_num_gpu": gpu_count,
+        "decode_engine_num_gpu": gpu_count,
+        "model_name": hf_model,
+        "profile_results_dir": "/workspace/profiling_results",
+        "metric_pulling_prometheus_endpoint": str(
+            _setting(
+                settings,
+                "metric_pulling_prometheus_endpoint",
+                "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090",
+            )
+        ),
+    }
+    planner: dict[str, Any] = {
+        "componentType": "planner",
+        "replicas": 1,
+        "extraPodSpec": {
+            "imagePullSecrets": image_pull_secrets,
+            "volumes": [{"name": profile_cm, "configMap": {"name": profile_cm}}],
+            "mainContainer": {
+                "image": str(_setting(settings, "nvidia_dgd_planner_image", image)),
+                "command": ["python3", "-m", "dynamo.planner"],
+                "args": ["--config", json.dumps(planner_config, separators=(",", ":"))],
+            },
+            "volumeMounts": [
+                {
+                    "name": profile_cm,
+                    "mountPath": "/workspace/profiling_results",
+                    "readOnly": True,
+                }
+            ],
+        },
+    }
+
+    if secret:
+        frontend["envFromSecret"] = secret
+    prefill = worker("prefill", prefill_replicas)
+    decode = worker("decode", decode_replicas)
+    if secret:
+        prefill["envFromSecret"] = secret
+        decode["envFromSecret"] = secret
+
+    return {
+        "backendFramework": "vllm",
+        "services": {
+            "Frontend": frontend,
+            "VllmPrefillWorker": prefill,
+            "VllmDecodeWorker": decode,
+            "Planner": planner,
+        },
+    }
+
+
 def render_vllm_agg_dgd_spec(payload: dict[str, Any], settings: Any) -> dict[str, Any]:
     """Render the current Phase 1 target: one aggregated vLLM Frontend + Worker DGD."""
     deploy_mode = (payload.get("deploy_mode") or "dgd").strip().lower()
@@ -101,7 +326,7 @@ def render_vllm_agg_dgd_spec(payload: dict[str, Any], settings: Any) -> dict[str
     if backend != "vllm":
         raise ValueError(f"nvidia_dgd renderer currently supports backend='vllm' only, got {backend!r}")
     if bool(payload.get("disagg_enabled")):
-        raise ValueError("nvidia_dgd renderer currently supports aggregated single-model DGD only")
+        return render_vllm_disagg_dgd_spec(payload, settings)
 
     hf_model = _hf_model(payload, settings)
     worker_replicas = _int_at_least(payload, "replicas_min", 1)

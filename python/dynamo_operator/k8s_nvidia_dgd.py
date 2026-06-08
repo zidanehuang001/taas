@@ -14,7 +14,12 @@ from kubernetes_asyncio import client, config, watch
 from kubernetes_asyncio.client.exceptions import ApiException
 
 from .config import Settings
-from .dgd_renderer import dgd_name_for_deployment, render_vllm_agg_dgd, render_vllm_agg_dgd_spec
+from .dgd_renderer import (
+    dgd_name_for_deployment,
+    render_profile_config_map,
+    render_vllm_agg_dgd,
+    render_vllm_agg_dgd_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,11 +120,33 @@ class NvidiaDgdClient:
     def _build_spec(self, payload: dict) -> dict[str, Any]:
         return render_vllm_agg_dgd_spec(payload, self._settings)
 
+    async def _ensure_profile_config_map(self, payload: dict) -> None:
+        if not bool(payload.get("disagg_enabled")):
+            return
+        core = await self._ensure_core_v1()
+        body = render_profile_config_map(payload, self._namespace)
+        name = body["metadata"]["name"]
+        try:
+            await core.create_namespaced_config_map(namespace=self._namespace, body=body)
+            logger.info("Created planner profile ConfigMap %s", name)
+        except ApiException as e:
+            if getattr(e, "status", None) != 409:
+                raise
+            current = await core.read_namespaced_config_map(name=name, namespace=self._namespace)
+            current.data = body.get("data", {})
+            current.metadata.labels = {
+                **(current.metadata.labels or {}),
+                **body["metadata"].get("labels", {}),
+            }
+            await core.replace_namespaced_config_map(name=name, namespace=self._namespace, body=current)
+            logger.info("Updated planner profile ConfigMap %s", name)
+
     async def create_from_payload(self, payload: dict) -> dict:
         deployment_id = payload["deployment_id"]
         name = dgd_name_for_deployment(deployment_id)
         api = await self._ensure_client()
         body = render_vllm_agg_dgd(payload, self._settings, self._namespace)
+        await self._ensure_profile_config_map(payload)
         result = await api.create_namespaced_custom_object(
             group=self._settings.nvidia_dgd_group,
             version=self._settings.nvidia_dgd_version,
@@ -128,13 +155,14 @@ class NvidiaDgdClient:
             body=body,
         )
         logger.info("Created DynamoGraphDeployment %s", name)
-        try:
-            await self._ensure_vllm_worker_discovery_service(deployment_id=deployment_id, dgd_name=name)
-        except Exception:
-            logger.exception(
-                "Failed to ensure worker discovery Service for %s (Frontend may list 0 backends)",
-                name,
-            )
+        if not bool(payload.get("disagg_enabled")):
+            try:
+                await self._ensure_vllm_worker_discovery_service(deployment_id=deployment_id, dgd_name=name)
+            except Exception:
+                logger.exception(
+                    "Failed to ensure worker discovery Service for %s (Frontend may list 0 backends)",
+                    name,
+                )
         return result
 
     async def _wait_dgd_worker_hash(self, dgd_name: str, timeout_s: float = 120.0) -> str:
@@ -253,9 +281,29 @@ class NvidiaDgdClient:
             except ApiException:
                 logger.exception("delete worker discovery Service %s", n)
 
+    async def _delete_profile_config_maps(self, deployment_id: str) -> None:
+        core = await self._ensure_core_v1()
+        try:
+            lst = await core.list_namespaced_config_map(
+                namespace=self._namespace,
+                label_selector=f"taas.io/deployment-id={deployment_id}",
+            )
+        except ApiException:
+            return
+        for cm in lst.items or []:
+            n = cm.metadata.name
+            if not n or not n.startswith("planner-profile-data-"):
+                continue
+            try:
+                await core.delete_namespaced_config_map(name=n, namespace=self._namespace)
+                logger.info("Deleted planner profile ConfigMap %s", n)
+            except ApiException:
+                logger.exception("delete planner profile ConfigMap %s", n)
+
     async def delete_for_deployment_id(self, deployment_id: str) -> None:
         name = dgd_name_for_deployment(deployment_id)
         await self._delete_worker_discovery_services(deployment_id)
+        await self._delete_profile_config_maps(deployment_id)
         api = await self._ensure_client()
         await api.delete_namespaced_custom_object(
             group=self._settings.nvidia_dgd_group,

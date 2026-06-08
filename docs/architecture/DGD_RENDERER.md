@@ -12,6 +12,9 @@ Supported now:
 - `deploy_mode: "dgd"`
 - `backend: "vllm"`
 - aggregated serving: `Frontend` + `VllmDecodeWorker`
+- single-model disaggregated serving: `Frontend` + `VllmPrefillWorker` +
+  `VllmDecodeWorker` + `Planner`
+- planner profile ConfigMap creation for disaggregated serving
 - Hugging Face model source from `hf_model`, `hf_model_id`, or `storage_uri`
 - runtime image override via `backend_image`
 - worker and frontend replica counts
@@ -23,7 +26,6 @@ Intentionally not in Phase 1:
 
 - DGDR / AIConfigurator profiling
 - SGLang or TensorRT-LLM rendering
-- disaggregated prefill/decode workers
 - shared GlobalPlanner across multiple models
 - multi-pool GlobalRouter / LocalRouter topology
 - Grove / KAI scheduling hints
@@ -57,11 +59,13 @@ Use a DGD direct deploy first. A successful Phase 1 validation means:
 
 1. UI creates a model and submits a DGD deployment.
 2. Gateway publishes `model.deploy.requested`.
-3. Operator creates one `DynamoGraphDeployment`.
-4. Dynamo controller creates Frontend and vLLM worker pods.
-5. Operator observes Ready and publishes `deployment.status.updated`.
-6. Gateway stores the running endpoint and registers it in LiteLLM.
-7. An OpenAI-compatible request succeeds through LiteLLM.
+3. Operator creates one profile ConfigMap when disaggregated serving is enabled.
+4. Operator creates one `DynamoGraphDeployment`.
+5. Dynamo controller creates Frontend, vLLM worker, and Planner pods.
+6. Operator observes Ready and publishes `deployment.status.updated`.
+7. Gateway stores the running endpoint and registers it in LiteLLM.
+8. An OpenAI-compatible request succeeds through LiteLLM.
 
-If this path works, the next branch can add shared GlobalPlanner and multi-model
-single-pool autoscaling.
+If this path works, the next branch can add shared GlobalPlanner namespace
+management, multi-model single-pool autoscaling, and richer rollout status
+display.

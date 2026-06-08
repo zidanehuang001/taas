@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from .dgd_renderer import dgd_name_for_deployment, render_vllm_agg_dgd
+import json
+
+from .dgd_renderer import dgd_name_for_deployment, render_profile_config_map, render_vllm_agg_dgd
 
 
 class DgdRendererTest(unittest.TestCase):
@@ -14,6 +16,8 @@ class DgdRendererTest(unittest.TestCase):
             nvidia_dgd_runtime_image="nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1",
             nvidia_dgd_hf_secret_name="hf-token-secret",
             nvidia_hf_model_default="Qwen/Qwen3-0.6B",
+            global_planner_namespace="dynamo-system-gp-ctrl",
+            metric_pulling_prometheus_endpoint="http://prometheus:9090",
         )
 
     def test_dgd_name_is_stable_and_short(self) -> None:
@@ -95,13 +99,73 @@ class DgdRendererTest(unittest.TestCase):
                 "dynamo-system",
             )
 
-    def test_rejects_disaggregated_dgd_for_phase_one(self) -> None:
-        with self.assertRaisesRegex(ValueError, "aggregated single-model DGD only"):
-            render_vllm_agg_dgd(
-                {"deployment_id": "dep-1", "deploy_mode": "dgd", "backend": "vllm", "disagg_enabled": True},
-                self.settings(),
-                "dynamo-system",
-            )
+    def test_render_vllm_disaggregated_dgd_with_planner(self) -> None:
+        body = render_vllm_agg_dgd(
+            {
+                "deployment_id": "7b8c3a9a-1e37-4a44-9f1b-a2c4e8d3f111",
+                "deploy_mode": "dgd",
+                "backend": "vllm",
+                "storage_uri": "Qwen/Qwen3-8B",
+                "disagg_enabled": True,
+                "prefill_replicas": 1,
+                "decode_replicas": 2,
+                "frontend_replicas": 1,
+                "gpu_count_per_replica": 1,
+                "tensor_parallel_size": 1,
+                "target_ttft_ms": 2000,
+                "target_itl_ms": 200,
+            },
+            self.settings(),
+            "dynamo-system",
+        )
+
+        services = body["spec"]["services"]
+        self.assertEqual(set(services), {"Frontend", "VllmPrefillWorker", "VllmDecodeWorker", "Planner"})
+        self.assertEqual(services["VllmPrefillWorker"]["subComponentType"], "prefill")
+        self.assertEqual(services["VllmDecodeWorker"]["subComponentType"], "decode")
+        self.assertEqual(services["VllmDecodeWorker"]["replicas"], 2)
+
+        prefill_args = services["VllmPrefillWorker"]["extraPodSpec"]["mainContainer"]["args"]
+        decode_args = services["VllmDecodeWorker"]["extraPodSpec"]["mainContainer"]["args"]
+        self.assertIn("--disaggregation-mode", prefill_args)
+        self.assertIn("prefill", prefill_args)
+        self.assertNotIn("--disaggregation-mode", decode_args)
+        self.assertIn("--kv-transfer-config", decode_args)
+
+        planner = services["Planner"]["extraPodSpec"]
+        planner_args = planner["mainContainer"]["args"]
+        self.assertEqual(planner_args[0], "--config")
+        cfg = json.loads(planner_args[1])
+        self.assertEqual(cfg["optimization_target"], "sla")
+        self.assertEqual(cfg["backend"], "vllm")
+        self.assertEqual(cfg["mode"], "disagg")
+        self.assertEqual(cfg["throughput_metrics_source"], "frontend")
+        self.assertEqual(cfg["profile_results_dir"], "/workspace/profiling_results")
+        self.assertEqual(cfg["global_planner_namespace"], "dynamo-system-gp-ctrl")
+        self.assertEqual(planner["volumes"][0]["configMap"]["name"], "planner-profile-data-dgd-7b8c3a9a1e374a449f1ba2c4")
+
+    def test_render_profile_config_map_for_disaggregated_planner(self) -> None:
+        cm = render_profile_config_map(
+            {
+                "deployment_id": "7b8c3a9a-1e37-4a44-9f1b-a2c4e8d3f111",
+                "profile_prefill_raw_data": {"prefill_isl": [128], "prefill_ttft": [10], "prefill_thpt_per_gpu": [100]},
+                "profile_decode_raw_data": {
+                    "x_kv_usage": [0.1],
+                    "y_context_length": [128],
+                    "z_itl": [20],
+                    "z_thpt_per_gpu": [100],
+                    "max_kv_tokens": 32768,
+                },
+            },
+            "dynamo-system",
+        )
+
+        self.assertEqual(cm["kind"], "ConfigMap")
+        self.assertEqual(cm["metadata"]["namespace"], "dynamo-system")
+        self.assertEqual(cm["metadata"]["name"], "planner-profile-data-dgd-7b8c3a9a1e374a449f1ba2c4")
+        self.assertIn("prefill_raw_data.json", cm["data"])
+        self.assertIn("decode_raw_data.json", cm["data"])
+        self.assertEqual(json.loads(cm["data"]["decode_raw_data.json"])["z_itl"], [20])
 
 
 if __name__ == "__main__":
